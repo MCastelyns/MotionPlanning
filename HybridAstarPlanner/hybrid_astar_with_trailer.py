@@ -55,18 +55,18 @@ class C:  # Parameter config
 class Node:
     def __init__(self, xind, yind, yawind, direction, x, y,
                  yaw, yawt, directions, steer, cost, pind):
-        self.xind = xind
-        self.yind = yind
-        self.yawind = yawind
-        self.direction = direction
-        self.x = x
-        self.y = y
-        self.yaw = yaw
-        self.yawt = yawt
-        self.directions = directions
-        self.steer = steer
-        self.cost = cost
-        self.pind = pind
+        self.xind = xind #X in grid coordinates
+        self.yind = yind #Y in grid coordinates
+        self.yawind = yawind #yaw of truck in grid coordinates (rounding to nearest multiple of yaw resolution)
+        self.direction = direction #-1 or +1
+        self.x = x #X in world coordinates
+        self.y = y #Y in world coordinates
+        self.yaw = yaw #yaw of truck in world coordinates
+        self.yawt = yawt #yaw of trailer in world coordinates
+        self.directions = directions #
+        self.steer = steer #current steering angle
+        self.cost = cost #Cost to go; cost it took us to reach this node
+        self.pind = pind #node index
 
 
 class Para:
@@ -133,18 +133,20 @@ def hybrid_astar_planning(sx, sy, syaw, syawt, gx, gy,
     :param yawreso: yaw resolution [m]
     :return: hybrid A* path
     """
+    # The nodes for the truck trailer are made using 4 state variables; x,y,theta0,theta1
+    sxr, syr = round(sx / xyreso), round(sy / xyreso) #Start x and y in grid coordinates (lists, including truck), divide world coordinate x and y by the resolution of the grid and round the value
+    gxr, gyr = round(gx / xyreso), round(gy / xyreso) #Goal x and y in grid coordinates (lists, including truck), divide world coordinate x and y by the resolution of the grid and round the value
+    syawr = round(rs.pi_2_pi(syaw) / yawreso) #First normalize start angle to be between -pi and +pi using rs.pi_2_pi, then divide it by the yaw resolution to give the yaw in a "yaw grid" coordinate
+    gyawr = round(rs.pi_2_pi(gyaw) / yawreso) #First normalize goal angle to be between -pi and +pi using rs.pi_2_pi, then divide it by the yaw resolution to give the yaw in a "yaw grid" coordinate
 
-    sxr, syr = round(sx / xyreso), round(sy / xyreso)
-    gxr, gyr = round(gx / xyreso), round(gy / xyreso)
-    syawr = round(rs.pi_2_pi(syaw) / yawreso)
-    gyawr = round(rs.pi_2_pi(gyaw) / yawreso)
+    nstart = Node(sxr, syr, syawr, 1, [sx], [sy], [syaw], [syawt], [1], 0.0, 0.0, -1) #Create start node using calculated values
+    ngoal = Node(gxr, gyr, gyawr, 1, [gx], [gy], [gyaw], [gyawt], [1], 0.0, 0.0, -1) #Create final node using calculated values
 
-    nstart = Node(sxr, syr, syawr, 1, [sx], [sy], [syaw], [syawt], [1], 0.0, 0.0, -1)
-    ngoal = Node(gxr, gyr, gyawr, 1, [gx], [gy], [gyaw], [gyawt], [1], 0.0, 0.0, -1)
-
+    # Making a kdtree using [x,y] for all x,y overlapping with obstacles
     kdtree = kd.KDTree([[x, y] for x, y in zip(ox, oy)])
     P = calc_parameters(ox, oy, xyreso, yawreso, kdtree)
 
+    # Make a heuristics map using the goal node and obstacles
     hmap = astar.calc_holonomic_heuristic_with_obstacle(ngoal, P.ox, P.oy, P.xyreso, 1.0)
     steer_set, direc_set = calc_motion_set()
     open_set, closed_set = {calc_index(nstart, P): nstart}, {}
@@ -291,26 +293,33 @@ def analystic_expantion(node, ngoal, P):
 
 
 def calc_next_node(n, ind, u, d, P):
+    #How far a single step should be
     step = C.XY_RESO * 2.0
 
-    nlist = math.ceil(step / C.MOVE_STEP)
-    xlist = [n.x[-1] + d * C.MOVE_STEP * math.cos(n.yaw[-1])]
+    #Number of interpolating steps to make per path step
+    nlist = math.ceil(step / C.MOVE_STEP) 
+
+    #Setting the first interpolating step values to a value calculated by the final part of the last node
+    xlist = [n.x[-1] + d * C.MOVE_STEP * math.cos(n.yaw[-1])] 
     ylist = [n.y[-1] + d * C.MOVE_STEP * math.sin(n.yaw[-1])]
     yawlist = [rs.pi_2_pi(n.yaw[-1] + d * C.MOVE_STEP / C.WB * math.tan(u))]
     yawtlist = [rs.pi_2_pi(n.yawt[-1] +
                            d * C.MOVE_STEP / C.RTR * math.sin(n.yaw[-1] - n.yawt[-1]))]
 
+    #Calculating all the remaining interpolation steps and adding them to the array of states
     for i in range(nlist - 1):
         xlist.append(xlist[i] + d * C.MOVE_STEP * math.cos(yawlist[i]))
         ylist.append(ylist[i] + d * C.MOVE_STEP * math.sin(yawlist[i]))
         yawlist.append(rs.pi_2_pi(yawlist[i] + d * C.MOVE_STEP / C.WB * math.tan(u)))
         yawtlist.append(rs.pi_2_pi(yawtlist[i] +
                                    d * C.MOVE_STEP / C.RTR * math.sin(yawlist[i] - yawtlist[i])))
-
+        
+    #Taking the last interpolation steps results and turning them into a point on the grid of x,y,yaw coordinates
     xind = round(xlist[-1] / P.xyreso)
     yind = round(ylist[-1] / P.xyreso)
     yawind = round(yawlist[-1] / P.yawreso)
 
+    #Initializing cost to 0 
     cost = 0.0
 
     if d > 0:
@@ -323,10 +332,10 @@ def calc_next_node(n, ind, u, d, P):
     if direction != n.direction:  # switch back penalty
         cost += C.GEAR_COST
 
-    cost += C.STEER_ANGLE_COST * abs(u)  # steer penalyty
+    cost += C.STEER_ANGLE_COST * abs(u)  # steer penalty
     cost += C.STEER_CHANGE_COST * abs(n.steer - u)  # steer change penalty
     cost += C.SCISSORS_COST * sum([abs(rs.pi_2_pi(x - y))
-                                   for x, y in zip(yawlist, yawtlist)])  # jacknif cost
+                                   for x, y in zip(yawlist, yawtlist)])  # jackknife cost
     cost = n.cost + cost
 
     directions = [direction for _ in range(len(xlist))]
@@ -547,53 +556,62 @@ def draw_model(x, y, yaw, yawt, steer, color='black'):
     wheel = np.array([[-C.TR, -C.TR, C.TR, C.TR, -C.TR],
                       [C.TW / 4, -C.TW / 4, -C.TW / 4, C.TW / 4, C.TW / 4]])
 
-    rlWheel = wheel.copy()
-    rrWheel = wheel.copy()
-    frWheel = wheel.copy()
-    flWheel = wheel.copy()
-    rltWheel = wheel.copy()
-    rrtWheel = wheel.copy()
+    rlWheel = wheel.copy() #Rear left wheel (truck)
+    rrWheel = wheel.copy() #Rear right wheel (truck)
+    frWheel = wheel.copy() #Front right wheel (truck)
+    flWheel = wheel.copy() #Front left wheel (truck)
+    rltWheel = wheel.copy() #Rear left wheel trailer
+    rrtWheel = wheel.copy() #Rear right wheel trailer
 
-    Rot1 = np.array([[math.cos(yaw), -math.sin(yaw)],
+    Rot1 = np.array([[math.cos(yaw), -math.sin(yaw)], #Rotation Matrix using yaw (the heading of the truck)
                      [math.sin(yaw), math.cos(yaw)]])
 
-    Rot2 = np.array([[math.cos(steer), -math.sin(steer)],
+    Rot2 = np.array([[math.cos(steer), -math.sin(steer)], #Rotation Matrix using steer (the steering angle)
                      [math.sin(steer), math.cos(steer)]])
 
-    Rot3 = np.array([[math.cos(yawt), -math.sin(yawt)],
+    Rot3 = np.array([[math.cos(yawt), -math.sin(yawt)], #Rotation Matrix using yawt (the heading of the trailer)
                      [math.sin(yawt), math.cos(yawt)]])
 
-    frWheel = np.dot(Rot2, frWheel)
-    flWheel = np.dot(Rot2, flWheel)
+    #Front wheels are the ones that have the steering angle, so take the dot product between the wheel matrices and the rotation matrix for steering angle
+    frWheel = np.dot(Rot2, frWheel)                                  
+    flWheel = np.dot(Rot2, flWheel) 
 
-    frWheel += np.array([[C.WB], [-C.WD / 2]])
+    #Putting the front wheels in the right position
+    frWheel += np.array([[C.WB], [-C.WD / 2]]) 
     flWheel += np.array([[C.WB], [C.WD / 2]])
-    rrWheel[1, :] -= C.WD / 2
-    rlWheel[1, :] += C.WD / 2
 
-    frWheel = np.dot(Rot1, frWheel)
-    flWheel = np.dot(Rot1, flWheel)
+    #Putting the rear wheels in the right position, doesnt need x component because our local origin is at this axis, so only y
+    rrWheel[1, :] -= C.WD / 2 
+    rlWheel[1, :] += C.WD / 2 
 
-    rrWheel = np.dot(Rot1, rrWheel)
-    rlWheel = np.dot(Rot1, rlWheel)
-    car = np.dot(Rot1, car)
+    #Now that our front wheels are already turned using the steering angle, next up is to turn the entire vehicle using rot1 (vehicle heading)
+    frWheel = np.dot(Rot1, frWheel) 
+    flWheel = np.dot(Rot1, flWheel)  
 
-    rltWheel += np.array([[-C.RTR], [C.WD / 2]])
-    rrtWheel += np.array([[-C.RTR], [-C.WD / 2]])
+    rrWheel = np.dot(Rot1, rrWheel)  
+    rlWheel = np.dot(Rot1, rlWheel)  
+    car = np.dot(Rot1, car) 
 
-    rltWheel = np.dot(Rot3, rltWheel)
-    rrtWheel = np.dot(Rot3, rrtWheel)
-    trail = np.dot(Rot3, trail)
+    #Positioning the rear trailer wheels correctly 
+    rltWheel += np.array([[-C.RTR], [C.WD / 2]]) 
+    rrtWheel += np.array([[-C.RTR], [-C.WD / 2]]) 
 
-    frWheel += np.array([[x], [y]])
-    flWheel += np.array([[x], [y]])
-    rrWheel += np.array([[x], [y]])
-    rlWheel += np.array([[x], [y]])
+    #Rotatin the entire trailer model using trailer heading
+    rltWheel = np.dot(Rot3, rltWheel) 
+    rrtWheel = np.dot(Rot3, rrtWheel) 
+    trail = np.dot(Rot3, trail) 
+
+    #Moving the entire build model towards the right x,y location
+    frWheel += np.array([[x], [y]]) 
+    flWheel += np.array([[x], [y]]) 
+    rrWheel += np.array([[x], [y]]) 
+    rlWheel += np.array([[x], [y]]) 
     rrtWheel += np.array([[x], [y]])
     rltWheel += np.array([[x], [y]])
-    car += np.array([[x], [y]])
-    trail += np.array([[x], [y]])
+    car += np.array([[x], [y]])     
+    trail += np.array([[x], [y]])   
 
+    #Plotting the vehicle+trailer at the found location, using the cornerpoints that we defined
     plt.plot(car[0, :], car[1, :], color)
     plt.plot(trail[0, :], trail[1, :], color)
     plt.plot(frWheel[0, :], frWheel[1, :], color)
@@ -605,7 +623,7 @@ def draw_model(x, y, yaw, yawt, steer, color='black'):
     draw.Arrow(x, y, yaw, C.WB * 0.8, color)
 
 
-def design_obstacles():
+def design_obstacles(): #Function to plot the obstacles on the map, returns 2 arrays of coordinates (ox,oy) where the line should be drawn
     ox, oy = [], []
 
     for i in range(-30, 31):
@@ -696,14 +714,17 @@ def test(x, y, yaw, yawt, ox, oy):
 def main():
     print("start!")
 
+    #Setting start states (x,y,theta0,theta1)
     sx, sy = 18.0, 34.0  # [m]
     syaw0 = np.deg2rad(180.0)
     syawt = np.deg2rad(180.0)
 
+    #Setting goal states (x,y,theta0,theta1)
     gx, gy = 0.0, 12.0  # [m]
     gyaw0 = np.deg2rad(90.0)
     gyawt = np.deg2rad(90.0)
 
+    #Getting obstacles line coordinates and plotting obstacles and the start and goal states
     ox, oy = design_obstacles()
     plt.plot(ox, oy, 'sk')
     draw_model(sx, sy, syaw0, syawt, 0.0)
@@ -711,6 +732,7 @@ def main():
     # test(sx, sy, syaw0, syawt, 3.5, 32)
     # plt.axis("equal")
     # plt.show()
+
 
     oox, ooy = ox[:], oy[:]
 
